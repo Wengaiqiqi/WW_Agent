@@ -1,0 +1,218 @@
+"""Slash commands for chat-platform gateways (QQ / Feishu).
+
+Whitelisted users drive remote A2A peers from chat:
+  /task <peer_id> <task>     one-shot delegation (comm.delegate)
+  /chat <peer_id> <message>  multi-turn conversation (comm.chat, context kept)
+  /peers                     list registered peer_ids
+  /help                      usage
+
+``handle_slash`` returns the reply STRING for a handled command, or ``None`` to
+fall through to the normal planner path (non-slash input, or an unrecognized
+/command). UI-free on purpose: the REPL's ReplCommandHandler is coupled to Rich
+rendering and an in-memory current-peer; the gateway runs one isolated turn per
+message and needs a plain-text reply.
+"""
+from __future__ import annotations
+
+import contextlib
+import json
+import os
+import threading
+from pathlib import Path
+from typing import Any
+
+from gateway import credentials as gw_creds
+from orchestrator.mcp_host import unwrap_tool_result as _unwrap
+
+COMM_AGENT_ID = "comm-agent"
+_RECOGNIZED = {"/task", "/chat", "/peers", "/help"}
+
+# Guards the read-modify-write of the shared chat-context store. The qq and
+# feishu gateways run as separate platforms (separate PID locks) but share this
+# one JSON file, so writes can interleave; the lock serialises in-process and
+# os.replace makes the on-disk swap atomic across processes.
+_STORE_LOCK = threading.Lock()
+
+
+def _platform_from_session_key(session_key: str) -> str:
+    """``qq:123`` -> ``qq``; ``feishu:abc`` -> ``feishu``; no prefix -> ``""``."""
+    if not session_key or ":" not in session_key:
+        return ""
+    return session_key.split(":", 1)[0]
+
+
+def _allowed_users(platform: str) -> list[str]:
+    """Read the per-platform allowlist from gateways.json.
+
+    Accepts either a comma-separated string (what the setup wizard writes) or a
+    JSON list (a hand-edited gateways.json). Empty / missing -> ``[]``.
+    """
+    if not platform:
+        return []
+    users = gw_creds.load(platform).get("allowed_users") or []
+    if isinstance(users, str):
+        users = [u.strip() for u in users.split(",") if u.strip()]
+    return [str(u) for u in users]
+
+
+def _is_authorized(session_key: str, user_id: str) -> bool:
+    """Fail-safe: no user id, or empty/missing allowlist, denies."""
+    if not user_id:
+        return False
+    return user_id in _allowed_users(_platform_from_session_key(session_key))
+
+
+async def _call_comm(host, tool: str, args: dict) -> tuple[bool, dict]:
+    """Call a comm.* tool; return (ok, data). data carries {'error': ...} on failure."""
+    import logging
+    _log = logging.getLogger(__name__)
+    try:
+        result = await host.call_tool(COMM_AGENT_ID, tool, args)
+    except Exception as exc:
+        _log.exception("comm-agent call_tool raised for %s", tool)
+        return False, {"error": f"comm-agent unreachable: {exc}"}
+    is_error, text = _unwrap(result)
+    if is_error:
+        _log.warning("comm-agent %s failed: %s", tool, text or "(empty error)")
+        return False, {"error": text or f"comm-agent error on {tool} (no detail)"}
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return False, {"error": f"invalid comm response: {text!r}"}
+    if not data.get("ok", True):
+        return False, {"error": data.get("error", str(data))}
+    return True, data
+
+
+_USAGE = (
+    "可用命令:\n"
+    "/task <peer_id> <任务>  — 委托一次性任务给远程 peer\n"
+    "/chat <peer_id> <消息>  — 与远程 peer 多轮对话\n"
+    "/peers                  — 列出已注册的 peer\n"
+    "/help                   — 显示本帮助"
+)
+
+
+async def _do_peers(host) -> str:
+    ok, data = await _call_comm(host, "comm.list_peers", {})
+    if not ok:
+        return f"获取 peer 列表失败:{data.get('error')}"
+    peers = data.get("peers", [])
+    if not peers:
+        return "还没有注册任何 peer。(在 REPL 里用 /comm add 添加)"
+    lines = ["已注册的 peer:"]
+    for p in peers:
+        lines.append(f"- {p.get('peer_id', '')} — {p.get('display_name', '')}")
+    return "\n".join(lines)
+
+
+def _render_final(final: Any) -> str:
+    """comm.delegate final_result may be a dict with A2A parts, a str, or None."""
+    if isinstance(final, dict):
+        parts_list = final.get("parts", [])
+        joined = "\n".join(
+            p.get("text", "") for p in parts_list
+            if isinstance(p, dict) and p.get("text")
+        )
+        return joined or json.dumps(final, ensure_ascii=False)
+    if final is None:
+        return "(无结果)"
+    return str(final)
+
+
+async def _do_task(host, parts: list[str]) -> str:
+    if len(parts) < 3 or not parts[2].strip():
+        return "用法:/task <peer_id> <任务>"
+    peer_id, task = parts[1], parts[2]
+    ok, data = await _call_comm(host, "comm.delegate", {
+        "peer_id": peer_id, "task": task, "stream": False,
+    })
+    if not ok:
+        return f"委托失败:{data.get('error')}"
+    return f"[{peer_id}] {_render_final(data.get('final_result'))}"
+
+
+def _context_store_path() -> Path:
+    from agent_paths import config_dir
+    return config_dir() / "comm_chat_contexts.json"
+
+
+def _load_chat_context(session_key: str, peer_id: str) -> str | None:
+    p = _context_store_path()
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data.get(f"{session_key}::{peer_id}")
+
+
+def _save_chat_context(session_key: str, peer_id: str, context_id: str) -> None:
+    p = _context_store_path()
+    with _STORE_LOCK:
+        try:
+            data = json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+        except (OSError, json.JSONDecodeError):
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        data[f"{session_key}::{peer_id}"] = context_id
+        p.parent.mkdir(parents=True, exist_ok=True)
+        # Atomic write: serialise to a temp file in the same dir, then
+        # os.replace() over the target. A torn write (another platform's
+        # gateway writing this same file) would otherwise leave invalid JSON
+        # that _load_chat_context silently discards — dropping EVERY peer's
+        # saved context, not just the racing one.
+        tmp = p.with_name(f"{p.name}.tmp{os.getpid()}")
+        try:
+            tmp.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8",
+            )
+            os.replace(tmp, p)
+        except OSError:
+            with contextlib.suppress(OSError):
+                tmp.unlink()
+
+
+async def _do_chat(host, parts: list[str], session_key: str) -> str:
+    if len(parts) < 3 or not parts[2].strip():
+        return "用法:/chat <peer_id> <消息>"
+    peer_id, message = parts[1], parts[2]
+    ctx = _load_chat_context(session_key, peer_id)
+    ok, data = await _call_comm(host, "comm.chat", {
+        "peer_id": peer_id, "message": message, "context_id": ctx,
+    })
+    if not ok:
+        return f"对话失败:{data.get('error')}"
+    new_ctx = data.get("context_id")
+    if new_ctx:
+        _save_chat_context(session_key, peer_id, new_ctx)
+    return f"[{peer_id}] {data.get('reply') or '(空回复)'}"
+
+
+async def handle_slash(line: str, *, host, session_key: str, user_id: str) -> str | None:
+    """Dispatch a chat-platform slash command. See module docstring for contract."""
+    line = (line or "").strip()
+    if not line.startswith("/"):
+        return None
+    parts = line.split(maxsplit=2)
+    command = parts[0].lower()
+    if command not in _RECOGNIZED:
+        return None  # unknown slash -> planner fall-through (today's behaviour)
+
+    if not _is_authorized(session_key, user_id):
+        return (
+            "抱歉,你没有权限使用这个命令。"
+            "(管理员可在 /gateway setup 的 allowed_users 里添加你的 user_id)"
+        )
+
+    if command == "/help":
+        return _USAGE
+    if command == "/peers":
+        return await _do_peers(host)
+    if command == "/task":
+        return await _do_task(host, parts)
+    if command == "/chat":
+        return await _do_chat(host, parts, session_key)
+    return None  # unreachable (command in _RECOGNIZED)

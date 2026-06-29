@@ -1,0 +1,145 @@
+import os
+import pytest
+from orchestrator.registry import Card
+from orchestrator.mcp_host import MCPHost, _build_agent_env
+
+
+def test_build_agent_env_strips_unwhitelisted_keys(monkeypatch):
+    """The orchestrator must drop random user-shell env vars at the agent
+    subprocess boundary — only whitelisted OS keys + ``MOCK_*`` + skills'
+    declared requiresEnv should survive."""
+    monkeypatch.setenv("NOTHING_TO_SEE_HERE", "leaky-secret")
+    env = _build_agent_env(hmac_key="k", agent_id="x")
+    assert "NOTHING_TO_SEE_HERE" not in env
+
+
+def test_build_agent_env_passes_skill_declared_keys(monkeypatch, tmp_path):
+    """Regression: a skill that declares ``requiresEnv: [\"BAIDU_EC_SEARCH_TOKEN\"]``
+    must see that env var inside the subprocess. Previously every non-whitelist
+    key was stripped, so skills that wrapped subprocess scripts (the whole
+    baidu-ecommerce-search family) couldn't authenticate."""
+    import json as _json
+    skill_dir = tmp_path / "skill_under_test"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("# x")
+    (skill_dir / "_meta.json").write_text(
+        _json.dumps({"requiresEnv": ["BAIDU_EC_SEARCH_TOKEN"]})
+    )
+
+    # Patch the skills dir helpers see — must redirect both the loader
+    # default AND the helper that mcp_host imports.
+    import skills.skill_loader as loader
+    monkeypatch.setattr(loader, "SKILLS_DIR", tmp_path)
+
+    monkeypatch.setenv("BAIDU_EC_SEARCH_TOKEN", "live-token-xyz")
+    env = _build_agent_env(hmac_key="k", agent_id="tool-agent")
+    assert env.get("BAIDU_EC_SEARCH_TOKEN") == "live-token-xyz"
+
+
+def test_build_agent_env_forwards_custom_endpoint_vars(monkeypatch):
+    """A web custom-endpoint turn sets base_url/protocol/api_key in the parent
+    env; a delegated specialist must inherit them so it can build the same
+    custom LLM. (These are only present when a custom endpoint is active.)"""
+    monkeypatch.setenv("LANGCHAIN_AGENT_BASE_URL", "https://example.test/v1")
+    monkeypatch.setenv("LANGCHAIN_AGENT_PROTOCOL", "openai")
+    monkeypatch.setenv("LANGCHAIN_AGENT_API_KEY", "sk-turn-key")
+    env = _build_agent_env(hmac_key="k", agent_id="tool-agent")
+    assert env["LANGCHAIN_AGENT_BASE_URL"] == "https://example.test/v1"
+    assert env["LANGCHAIN_AGENT_PROTOCOL"] == "openai"
+    assert env["LANGCHAIN_AGENT_API_KEY"] == "sk-turn-key"
+
+
+@pytest.mark.asyncio
+async def test_spawn_closes_stack_when_handshake_fails(monkeypatch):
+    """A spawn that fails before the handle is registered must still tear down
+    its stdio subprocess — otherwise it leaks (shutdown_all only reaps handles
+    in _clients, which a failed spawn never reaches)."""
+    import orchestrator.mcp_host as mh
+
+    events: list[str] = []
+
+    class _FakeStdio:
+        async def __aenter__(self):
+            events.append("stdio-enter")
+            return ("read", "write")
+
+        async def __aexit__(self, *a):
+            events.append("stdio-exit")
+            return False
+
+    class _FakeSession:
+        def __init__(self, read, write):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def initialize(self):
+            raise RuntimeError("handshake failed")
+
+    monkeypatch.setattr(mh, "stdio_client", lambda params: _FakeStdio())
+    monkeypatch.setattr(mh, "ClientSession", _FakeSession)
+
+    host = MCPHost(hmac_key="k")
+    card = Card(
+        id="tool-agent", display_name="T", version="1",
+        entrypoint={"type": "python", "module": "agents.tool_agent.main", "args": []},
+        mcp={}, a2a={}, capabilities_hint=[], model_override=None,
+    )
+
+    with pytest.raises(RuntimeError, match="handshake failed"):
+        await host.spawn(card)
+
+    assert "stdio-exit" in events, "stdio subprocess was not torn down on failure"
+    assert "tool-agent" not in host._clients
+
+
+@pytest.mark.e2e
+@pytest.mark.asyncio
+async def test_mcp_host_spawns_tool_agent_and_calls_read_file(tmp_path):
+    target = tmp_path / "hello.txt"
+    target.write_text("hi there", encoding="utf-8")
+
+    card = Card(
+        id="tool-agent", display_name="T", version="1",
+        entrypoint={"type": "python", "module": "agents.tool_agent.main", "args": []},
+        mcp={"transport": "stdio"},
+        a2a={"transport": "http", "port_strategy": "ephemeral"},
+        capabilities_hint=["tool"], model_override=None,
+    )
+
+    host = MCPHost(hmac_key="test-key")
+    await host.spawn(card)
+    try:
+        tools = await host.list_tools("tool-agent")
+        assert "read_file" in [t.name for t in tools]
+    finally:
+        await host.shutdown_all()
+
+
+def test_build_agent_env_uses_turn_env_overlay_not_os_environ(monkeypatch):
+    # A per-turn value provided via the overlay must win and must NOT require
+    # the parent os.environ to be mutated.
+    monkeypatch.delenv("LANGCHAIN_AGENT_MEMORY_USER", raising=False)
+    monkeypatch.delenv("LANGCHAIN_AGENT_WORKSPACE_ROOT", raising=False)
+    overlay = {
+        "LANGCHAIN_AGENT_MEMORY_USER": "alice",
+        "LANGCHAIN_AGENT_WORKSPACE_ROOT": "/ws/alice",
+        "LANGCHAIN_AGENT_RUNTIME_DIR": "/rt/t1",
+    }
+    env = _build_agent_env(hmac_key="h", agent_id="tool-agent", turn_env=overlay)
+    assert env["LANGCHAIN_AGENT_MEMORY_USER"] == "alice"
+    assert env["LANGCHAIN_AGENT_WORKSPACE_ROOT"] == "/ws/alice"
+    assert env["LANGCHAIN_AGENT_RUNTIME_DIR"] == "/rt/t1"
+    # The parent process env was not touched.
+    assert "LANGCHAIN_AGENT_MEMORY_USER" not in os.environ
+
+
+def test_build_agent_env_overlay_overrides_parent_env(monkeypatch):
+    monkeypatch.setenv("LANGCHAIN_AGENT_MODEL", "parent/model")
+    env = _build_agent_env(hmac_key="h", agent_id="tool-agent",
+                           turn_env={"LANGCHAIN_AGENT_MODEL": "turn/model"})
+    assert env["LANGCHAIN_AGENT_MODEL"] == "turn/model"

@@ -1,0 +1,317 @@
+from __future__ import annotations
+
+import json
+
+import pytest
+from fastapi.testclient import TestClient
+
+from web import config, store
+from web.app import create_app
+
+
+@pytest.fixture
+def client(db_path, web_secret):
+    store.init_db(db_path)
+
+    async def fake_bridge(prompt, *, trace_id, session_key, user_id, model_id):
+        yield {"type": "text", "chunk": f"echo:{prompt}"}
+        yield {"type": "done", "text": f"echo:{prompt}"}
+
+    app = create_app(
+        db_path=db_path, secret=web_secret, bridge_fn=fake_bridge, cookie_secure=False
+    )
+    return TestClient(app)
+
+
+def test_health_ok(client):
+    r = client.get("/api/health")
+    assert r.status_code == 200
+    assert r.json()["status"] == "ok"
+
+
+def test_me_requires_auth(client):
+    r = client.get("/api/me")
+    assert r.status_code == 401
+
+
+def test_register_login_me_logout(client):
+    r = client.post("/api/auth/register", json={"username": "alice", "password": "pw12345"})
+    assert r.status_code == 200
+    assert r.json()["username"] == "alice"
+    # cookie set -> /api/me now works on the same client (cookie jar persists)
+    me = client.get("/api/me")
+    assert me.status_code == 200 and me.json()["username"] == "alice"
+    # logout clears cookie
+    assert client.post("/api/auth/logout").status_code == 200
+    assert client.get("/api/me").status_code == 401
+    # login again
+    r2 = client.post("/api/auth/login", json={"username": "alice", "password": "pw12345"})
+    assert r2.status_code == 200
+    assert client.get("/api/me").status_code == 200
+
+
+def test_register_duplicate_username(client):
+    client.post("/api/auth/register", json={"username": "bob", "password": "pw12345"})
+    r = client.post("/api/auth/register", json={"username": "bob", "password": "other123"})
+    assert r.status_code == 409
+
+
+def test_login_wrong_password(client):
+    client.post("/api/auth/register", json={"username": "carol", "password": "right123"})
+    r = client.post("/api/auth/login", json={"username": "carol", "password": "wrong123"})
+    assert r.status_code == 401
+
+
+def test_signup_code_gate(db_path, web_secret, monkeypatch):
+    monkeypatch.setenv("WEB_SIGNUP_CODE", "letmein")
+    store.init_db(db_path)
+
+    async def fake_bridge(prompt, **kw):
+        yield {"type": "done", "text": ""}
+
+    app = create_app(db_path=db_path, secret=web_secret, bridge_fn=fake_bridge, cookie_secure=False)
+    c = TestClient(app)
+    assert c.post("/api/auth/register", json={"username": "dan", "password": "pw12345"}).status_code == 403
+    ok = c.post("/api/auth/register",
+                json={"username": "dan", "password": "pw12345", "signup_code": "letmein"})
+    assert ok.status_code == 200
+
+
+def _register(c, name="alice", pw="pw12345"):
+    assert c.post("/api/auth/register", json={"username": name, "password": pw}).status_code == 200
+
+
+def test_conversation_crud(client):
+    _register(client)
+    r = client.post("/api/conversations", json={"title": "first"})
+    assert r.status_code == 200
+    cid = r.json()["id"]
+    assert client.get("/api/conversations").json()[0]["id"] == cid
+    assert client.patch(f"/api/conversations/{cid}", json={"title": "renamed"}).status_code == 200
+    assert client.get("/api/conversations").json()[0]["title"] == "renamed"
+    assert client.delete(f"/api/conversations/{cid}").status_code == 200
+    assert client.get("/api/conversations").json() == []
+
+
+def test_cannot_touch_other_users_conversation(db_path, web_secret):
+    store.init_db(db_path)
+
+    async def fake_bridge(prompt, **kw):
+        yield {"type": "done", "text": ""}
+
+    app = create_app(db_path=db_path, secret=web_secret, bridge_fn=fake_bridge, cookie_secure=False)
+    alice = TestClient(app)
+    bob = TestClient(app)
+    _register(alice, "alice")
+    _register(bob, "bob")
+    cid = alice.post("/api/conversations", json={"title": "secret"}).json()["id"]
+    # bob must not see, read, rename, or delete alice's conversation
+    assert bob.get(f"/api/conversations/{cid}/messages").status_code == 404
+    assert bob.patch(f"/api/conversations/{cid}", json={"title": "hax"}).status_code == 404
+    assert bob.delete(f"/api/conversations/{cid}").status_code == 404
+
+
+def test_models_route(client, monkeypatch):
+    import web.models as models_mod
+    monkeypatch.setattr(models_mod, "available_models",
+                        lambda: [{"id": "anthropic/claude-opus-4-7", "provider": "anthropic",
+                                  "label": "Anthropic", "model": "claude-opus-4-7"}])
+    _register(client, "ed")
+    r = client.get("/api/models")
+    assert r.status_code == 200
+    assert r.json()[0]["id"] == "anthropic/claude-opus-4-7"
+
+
+def test_models_requires_auth(client):
+    assert client.get("/api/models").status_code == 401
+
+
+def _sse_events(resp):
+    """Parse an SSE response body into a list of event dicts."""
+    out = []
+    for raw in resp.text.split("\n\n"):
+        raw = raw.strip()
+        if raw.startswith("data: "):
+            out.append(json.loads(raw[6:]))
+    return out
+
+
+def test_chat_streams_and_persists(client):
+    _register(client, "frank")
+    cid = client.post("/api/conversations", json={"title": "c"}).json()["id"]
+    r = client.post(f"/api/conversations/{cid}/messages",
+                    json={"content": "hello", "model": "mock"})
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/event-stream")
+    events = _sse_events(r)
+    assert {"type": "text", "chunk": "echo:hello"} in events
+    assert events[-1]["type"] == "done"
+    # persisted: user + assistant
+    msgs = client.get(f"/api/conversations/{cid}/messages").json()
+    assert [m["role"] for m in msgs] == ["user", "assistant"]
+    assert msgs[0]["content"] == "hello"
+    assert msgs[1]["content"] == "echo:hello"
+
+
+def test_chat_rejects_overlong_message(client):
+    _register(client, "gwen")
+    cid = client.post("/api/conversations", json={}).json()["id"]
+    huge = "x" * (config.MAX_MESSAGE_CHARS + 1)
+    r = client.post(f"/api/conversations/{cid}/messages", json={"content": huge})
+    assert r.status_code == 413
+
+
+def test_chat_other_user_conversation_404(db_path, web_secret):
+    store.init_db(db_path)
+
+    async def fake_bridge(prompt, **kw):
+        yield {"type": "done", "text": "x"}
+
+    app = create_app(db_path=db_path, secret=web_secret, bridge_fn=fake_bridge, cookie_secure=False)
+    a, b = TestClient(app), TestClient(app)
+    _register(a, "a")
+    _register(b, "b")
+    cid = a.post("/api/conversations", json={}).json()["id"]
+    r = b.post(f"/api/conversations/{cid}/messages", json={"content": "hi"})
+    assert r.status_code == 404
+
+
+def test_index_served(client):
+    r = client.get("/")
+    assert r.status_code == 200
+    # Branding string is "W&W 多智能体" since the Hermes reskin (commit 8ccc31d).
+    assert "W&amp;W" in r.text or "W&W" in r.text
+
+
+def test_static_assets_revalidate(client):
+    # index + static assets must not be cached aggressively, so a code change
+    # shows up on a normal refresh instead of serving a stale app.js.
+    assert client.get("/").headers.get("cache-control") == "no-cache"
+    assert client.get("/static/app.js").headers.get("cache-control") == "no-cache"
+
+
+def test_endpoint_routes_crud_and_no_key_leak(client, monkeypatch):
+    # Placeholder host doesn't resolve; bypass the SSRF guard for this CRUD test
+    # (a dedicated test below covers the guard rejecting private hosts).
+    monkeypatch.setenv("LANGCHAIN_AGENT_ALLOW_PRIVATE_URLS", "1")
+    _register(client, "ned")
+    r = client.post("/api/endpoints", json={
+        "label": "My LLM", "base_url": "https://x.test/v1",
+        "api_key": "sk-secret", "model": "gpt-5.4", "protocol": "openai",
+    })
+    assert r.status_code == 200
+    eid = r.json()["id"]
+    assert "api_key" not in r.json()
+    listed = client.get("/api/endpoints").json()
+    assert listed[0]["id"] == eid and "api_key" not in listed[0]
+    assert client.delete(f"/api/endpoints/{eid}").status_code == 200
+    assert client.get("/api/endpoints").json() == []
+
+
+def test_endpoint_create_rejects_private_base_url(client):
+    # SSRF guard: an authenticated user must not be able to point the server's
+    # LLM client at loopback / link-local / cloud-metadata addresses.
+    _register(client, "mallory")
+    for bad in ("http://127.0.0.1:11434/v1",
+                "http://169.254.169.254/latest/meta-data/",
+                "http://[::1]:8000/v1"):
+        r = client.post("/api/endpoints", json={
+            "label": "evil", "base_url": bad,
+            "api_key": "k", "model": "m", "protocol": "openai",
+        })
+        assert r.status_code == 400, bad
+        assert "not allowed" in r.json()["detail"]
+
+
+def test_endpoint_create_validates(client):
+    _register(client, "nora")
+    assert client.post("/api/endpoints", json={
+        "label": "", "base_url": "https://x/v1", "api_key": "k", "model": "m",
+    }).status_code == 400
+    assert client.post("/api/endpoints", json={
+        "label": "L", "base_url": "https://x/v1", "api_key": "k", "model": "m",
+        "protocol": "weird",
+    }).status_code == 400
+
+
+def test_endpoints_require_auth(client):
+    assert client.get("/api/endpoints").status_code == 401
+
+
+def test_cannot_delete_other_users_endpoint(db_path, web_secret, monkeypatch):
+    monkeypatch.setenv("LANGCHAIN_AGENT_ALLOW_PRIVATE_URLS", "1")
+    store.init_db(db_path)
+
+    async def fake_bridge(prompt, **kw):
+        yield {"type": "done", "text": ""}
+
+    app = create_app(db_path=db_path, secret=web_secret, bridge_fn=fake_bridge, cookie_secure=False)
+    alice, bob = TestClient(app), TestClient(app)
+    _register(alice, "alice")
+    _register(bob, "bob")
+    eid = alice.post("/api/endpoints", json={
+        "label": "L", "base_url": "https://x/v1", "api_key": "k", "model": "m",
+    }).json()["id"]
+    assert bob.delete(f"/api/endpoints/{eid}").status_code == 404
+
+
+def test_chat_with_endpoint_id_routes_endpoint_fields(
+    db_path, web_secret, tmp_config_dir, monkeypatch
+):
+    """Selecting a custom endpoint passes base_url/api_key/protocol + a
+    custom/<model> id into the bridge. The api_key is stored encrypted and
+    decrypted on use, so the bridge still receives the plaintext key."""
+    monkeypatch.setenv("LANGCHAIN_AGENT_ALLOW_PRIVATE_URLS", "1")
+    store.init_db(db_path)
+    captured = {}
+
+    async def fake_bridge(prompt, *, trace_id, session_key, user_id,
+                          model_id, base_url="", api_key="", protocol=""):
+        captured.update(model_id=model_id, base_url=base_url,
+                        api_key=api_key, protocol=protocol)
+        yield {"type": "done", "text": "ok"}
+
+    app = create_app(db_path=db_path, secret=web_secret,
+                     bridge_fn=fake_bridge, cookie_secure=False)
+    c = TestClient(app)
+    _register(c, "olivia")
+    eid = c.post("/api/endpoints", json={
+        "label": "L", "base_url": "https://x.test/v1", "api_key": "sk-z",
+        "model": "gpt-5.4", "protocol": "anthropic",
+    }).json()["id"]
+    cid = c.post("/api/conversations", json={}).json()["id"]
+    r = c.post(f"/api/conversations/{cid}/messages",
+               json={"content": "hi", "endpoint_id": eid})
+    assert r.status_code == 200
+    assert captured == {
+        "model_id": "custom/gpt-5.4", "base_url": "https://x.test/v1",
+        "api_key": "sk-z", "protocol": "anthropic",
+    }
+
+
+def test_app_shutdown_drains_pool(db_path, web_secret, monkeypatch):
+    from starlette.testclient import TestClient
+
+    from web import bridge
+
+    drained = {"n": 0}
+
+    class _FakePool:
+        async def drain(self):
+            drained["n"] += 1
+
+    monkeypatch.setattr(bridge, "_POOL", _FakePool())
+    monkeypatch.setattr(bridge, "_get_pool", lambda: bridge._POOL)
+
+    # Real bridge => the shutdown hook is registered, but keep startup hermetic
+    # (no real specialist spawn from the catalog warm-up).
+    async def _noop():
+        return None
+
+    monkeypatch.setattr(bridge, "warm_capability_catalog", _noop)
+
+    from web.app import create_app
+    app = create_app(db_path=db_path, secret=web_secret, cookie_secure=False)
+    with TestClient(app):
+        pass  # entering+exiting the context triggers startup+shutdown
+    assert drained["n"] == 1

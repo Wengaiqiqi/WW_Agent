@@ -1,0 +1,280 @@
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ww-agent-cli"
+version = "0.1.0"
+description = "W&W Agent CLI — multi-agent + single-agent LangChain/LangGraph terminal assistant."
+readme = "用户手册.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+authors = [
+    { name = "W&W Agent CLI maintainers" },
+]
+keywords = ["langchain", "langgraph", "agent", "cli", "multi-agent", "mcp", "a2a"]
+classifiers = [
+    "Environment :: Console",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development",
+]
+
+# Runtime dependencies needed to boot the CLI in either single- or multi-agent
+# mode. Heavy skill-specific dependencies live under ``[project.optional-dependencies]``
+# so a vanilla install stays under ~150 MB of wheels instead of pulling
+# PyMuPDF / CairoSVG / google-genai / etc.
+dependencies = [
+    "langchain>=0.3.0",
+    # langchain-core is pulled in transitively by langchain, but we import it
+    # directly across the agent loop / tools, so pin it as a first-class dep.
+    "langchain-core>=0.3.0",
+    "langchain-openai>=0.3.0",
+    "langchain-anthropic>=0.3.0",
+    "langchain-community>=0.3.0",
+    "langgraph>=0.2.0",
+    "rich>=13.0.0",
+    "prompt_toolkit>=3.0.0",
+    # Multi-agent (orchestrator + MCP/A2A specialists)
+    "mcp>=1.0.0",
+    "a2a-sdk>=0.2.0",
+    "pyjwt>=2.8.0",
+    "httpx>=0.27.0",
+    "fastapi>=0.110.0",
+    # Imported directly by the hand-rolled A2A server/protocol layer
+    # (agents/comm_agent/a2a_protocol.py, agents/shared/a2a_server.py), not
+    # only as a fastapi transitive dep.
+    "starlette>=0.37.0",
+    "uvicorn>=0.29.0",
+    "psutil>=5.9.0",
+    # Encrypts custom-endpoint API keys at rest (web/crypto.py); also used by
+    # the Feishu gateway for AES decryption.
+    "cryptography>=42.0.0",
+    # Pydantic is brought in by langchain/fastapi but we use it explicitly
+    # for planner decision validation.
+    "pydantic>=2.0",
+    # Chat-platform gateways: QQ Official Bot (websockets) + Feishu
+    # long-connection adapter (lark-oapi). Part of the booted surface, so
+    # kept in runtime deps rather than an optional extra.
+    "websockets>=12.0",
+    "lark-oapi>=1.4.0",
+    # Imported directly by config/_settings.py for provider detection.
+    "requests>=2.32.5",
+]
+
+[project.optional-dependencies]
+# Bundled skill: ppt-master (PDF/DOCX/SVG conversion, image generation,
+# narration). Install with: ``pip install '.[skill-ppt-master]'``.
+skill-ppt-master = [
+    "python-pptx>=0.6.21",
+    "edge-tts>=7.2.8",
+    "svglib>=1.5.0",
+    "reportlab>=4.0.0",
+    "PyMuPDF>=1.23.0",
+    "mammoth>=1.6.0",
+    "markdownify>=0.11.6",
+    "ebooklib>=0.18",
+    "nbconvert>=7.0.0",
+    "openpyxl>=3.1.0",
+    "Pillow>=9.0.0",
+    "numpy>=1.20.0",
+    "requests>=2.31.0",
+    "beautifulsoup4>=4.12.0",
+    "curl_cffi>=0.7.0",
+    "google-genai>=1.0.0",
+    "openai>=1.0.0",
+    "flask>=3.0.0",
+]
+# Document parsers that tool-agent's ReAct loop reaches for when reading
+# binary files (.docx / .pdf / .xlsx / images). Optional because the agent
+# probes and ``pip install``s on demand if missing.
+docs = [
+    "python-docx>=1.0",
+    "pypdf>=4.0",
+    "openpyxl>=3.1",
+    "Pillow>=9.0",
+    "pandas>=2.0",
+    "striprtf>=0.0.26",
+]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=4.0.0",
+    "pytest-mock>=3.10.0",
+    "black>=23.0.0",
+    "flake8>=6.0.0",
+    "mypy>=1.0.0",
+    "trustme>=1.0.0",
+    "bandit>=1.7.0",
+    "pip-audit>=2.7.0",
+]
+
+[project.scripts]
+ww-agent = "cli:main"
+
+# ---------------------------------------------------------------------------
+# Hatch packaging
+# ---------------------------------------------------------------------------
+# Treat the top-level Python modules and the agent + tool + orchestrator
+# packages as the distribution. Tests, docs, htmlcov, runtime dirs are excluded.
+[tool.hatch.build.targets.wheel]
+packages = [
+    "agents",
+    "bridge",
+    "config",
+    "gateway",
+    "orchestrator",
+    "skills",
+    "tool",
+    "web",
+]
+include = [
+    "agent_display.py",
+    "agent_paths.py",
+    "cli.py",
+    "project_context.py",
+    "prompt_rules.py",
+]
+
+[tool.hatch.build.targets.wheel.force-include]
+".agent/agents" = ".agent/agents"
+"agent_display.py" = "agent_display.py"
+"agent_paths.py" = "agent_paths.py"
+"cli.py" = "cli.py"
+"project_context.py" = "project_context.py"
+"prompt_rules.py" = "prompt_rules.py"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/.agent/agents",
+    "/agents",
+    "/bridge",
+    "/config",
+    "/gateway",
+    "/orchestrator",
+    "/skills",
+    "/tool",
+    "/web",
+    "/tests",
+    "agent_display.py",
+    "agent_paths.py",
+    "cli.py",
+    "project_context.py",
+    "prompt_rules.py",
+    "用户手册.md",
+    "README.md",
+    "install.ps1",
+    "start_web.bat",
+    "邀请码开关.bat",
+    "requirements.txt",
+    "setup.cfg",
+]
+
+# ---------------------------------------------------------------------------
+# pytest
+# ---------------------------------------------------------------------------
+# Canonical test configuration.
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "-v",
+    "--strict-markers",
+    "--tb=short",
+]
+markers = [
+    "e2e: end-to-end tests that spawn subprocesses",
+]
+
+# ---------------------------------------------------------------------------
+# Coverage
+# ---------------------------------------------------------------------------
+[tool.coverage.run]
+source = ["."]
+omit = [
+    "tests/*",
+    "__pycache__/*",
+    ".langchain-agent/*",
+    ".claude/*",
+    "skills/*",
+    "*/__pycache__/*",
+    "*/tests/*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+    "@abstractmethod",
+]
+
+# ---------------------------------------------------------------------------
+# mypy — strict per-module opt-in
+# ---------------------------------------------------------------------------
+# Goal: ratchet strict typing across the codebase without breaking the entire
+# build to start. The pure-logic, low-dependency modules below already type
+# clean and serve as the floor — adding to this list should be a deliberate
+# act, with any inferred-Any escape hatches gone first.
+[tool.mypy]
+python_version = "3.11"
+# Project-wide default stays loose so existing code (notably the legacy CLI's
+# 1500-line module with langchain/rich runtime objects flowing through) doesn't
+# block CI on mypy bugs unrelated to the change at hand.
+ignore_missing_imports = true
+# Global-only flags. Per-module overrides below pick the rest of strict mode.
+warn_redundant_casts = true
+strict_equality = true
+
+# Strict mode for the pure-logic modules listed below. Each entry should be
+# both well-typed *and* free of third-party imports that would force
+# ``ignore_missing_imports`` exceptions — otherwise the value of strict is
+# diluted to "ignore warnings about langchain stubs".
+[[tool.mypy.overrides]]
+module = [
+    "agent_display",
+    "prompt_rules",
+    "agent_paths",
+    "agents.shared.permission_modes",
+    "agents.shared.authz",
+    "agents.tool_agent.clarify_bridge",
+    "orchestrator.repl_types",
+    "orchestrator.router",
+    "orchestrator.stream_mux",
+    "orchestrator.registry",
+    "orchestrator.repl_state",
+    "orchestrator.permission_gate",
+    "skills.skill_loader",
+]
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_unused_ignores = true
+warn_return_any = true
+no_implicit_reexport = true
+
+# ---------------------------------------------------------------------------
+# black + flake8 (flake8 reads setup.cfg because it does not read pyproject
+# natively without a plugin)
+# ---------------------------------------------------------------------------
+[tool.black]
+line-length = 100
+target-version = ["py311", "py312"]
+
+[tool.bandit]
+# First-party static security scan. Scope to product code; tests use asserts
+# and spawn subprocess fixtures freely.
+exclude_dirs = ["tests", ".venv", "build", "dist", "scripts", ".tmp"]
+# B101 assert_used: invariants in non-test code. B404/B603/B607 subprocess:
+# spawning specialist subprocesses over MCP/A2A IS the product architecture.
+skips = ["B101", "B404", "B603", "B607"]
